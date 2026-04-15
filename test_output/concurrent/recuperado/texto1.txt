@@ -1,0 +1,11 @@
+Este es el primer archivo de prueba para el compresor Huffman.
+La compresion de Huffman asigna codigos mas cortos a los caracteres mas frecuentes.
+Este texto tiene repeticiones: aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj.
+El algoritmo construye un arbol binario basado en las frecuencias de cada caracter.
+Los caracteres con mayor frecuencia quedan mas cerca de la raiz del arbol.
+Texto de relleno para aumentar el tamano del archivo y hacer la prueba mas representativa.
+abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789
+La compresion es mas efectiva cuando hay mucha redundancia en el texto.
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Este archivo deberia comprimirse bien dado que tiene muchos caracteres repetidos.

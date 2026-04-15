@@ -1,0 +1,19 @@
+Segundo archivo de prueba - sistemas operativos.
+fork() crea un proceso hijo que es una copia exacta del proceso padre.
+El proceso hijo hereda descriptores de archivo, variables de entorno y mas.
+waitpid() hace que el padre espere a que un hijo especifico termine.
+WIFEXITED(status) verifica si el hijo termino normalmente.
+WEXITSTATUS(status) obtiene el codigo de retorno del hijo.
+
+pthread_create() crea un nuevo hilo de ejecucion.
+pthread_join() espera a que un hilo termine.
+pthread_mutex_lock() y pthread_mutex_unlock() protegen regiones criticas.
+Una region critica es una seccion de codigo que solo puede ejecutar un hilo a la vez.
+Los semaforos son otro mecanismo de sincronizacion entre hilos y procesos.
+
+Diferencia entre paralelismo y concurrencia:
+- Paralelismo: tareas ejecutandose SIMULTANEAMENTE en multiples CPUs.
+- Concurrencia: tareas que se intercalan en el tiempo, pueden ser en un solo CPU.
+fork() logra paralelismo real si hay multiples nucleos disponibles.
+pthreads logra concurrencia (y paralelismo en sistemas multi-core).
+1234567890 !@#$%^&*() abcdefghijklmnopqrstuvwxyz
