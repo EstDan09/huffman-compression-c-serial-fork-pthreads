@@ -1,0 +1,293 @@
+EXPLICACION DE COMPRESS.C
+(como si tuvieras 10 años)
+===========================
+
+Este archivo es el COMPRESOR. Su trabajo es:
+  Recibir una carpeta con archivos de texto
+  -> meter todos esos archivos en UN SOLO archivo comprimido (.bin)
+
+Piensalo como una mochila magica: metes varios libros y la mochila
+los aplasta y los guarda todos juntos en mucho menos espacio.
+
+
+================================================
+LA HISTORIA COMPLETA (lo que hace main)
+================================================
+
+Cuando ejecutas el programa asi:
+  ./compress mi_carpeta resultado.bin
+
+El programa hace esto en orden:
+
+  1. Revisa que le diste exactamente 2 argumentos (carpeta y archivo
+     de salida). Si no, te explica como usarlo y se cierra.
+
+  2. Recorre la carpeta buscando todos los archivos de texto.
+     Los guarda en una lista.
+
+  3. Abre el archivo de salida resultado.bin para escribir.
+
+  4. Escribe una "firma" al inicio del archivo: HUF1
+     Esto es como ponerle una etiqueta a la mochila que dice
+     "soy un archivo Huffman version 1".
+
+  5. Escribe cuantos archivos va a guardar adentro.
+
+  6. Por cada archivo de la lista, lo comprime y lo mete al .bin.
+
+  7. Cierra todo y te dice "listo!".
+
+
+================================================
+ESTRUCTURA: FileList
+================================================
+
+Antes de ver las funciones, hay que entender esta estructura.
+Es simplemente una lista de nombres de archivos:
+
+  items    -> array de strings (los nombres/rutas)
+  count    -> cuantos archivos hay en la lista
+  capacity -> cuantos caben antes de necesitar mas espacio
+
+Es igual al MinHeap pero en vez de nodos guarda rutas de archivos.
+
+
+================================================
+FUNCION 1: file_list_init(list)
+================================================
+
+QUE HACE:
+  Prepara la lista vacia antes de usarla.
+  items=NULL, count=0, capacity=0.
+
+CUANDO SE USA:
+  Al inicio del main, antes de empezar a buscar archivos.
+
+
+================================================
+FUNCION 2: file_list_free(list)
+================================================
+
+QUE HACE:
+  Cuando terminas, libera la memoria de cada nombre de archivo
+  guardado y luego libera el array.
+
+CUANDO SE USA:
+  Al final del main o si algo sale mal.
+
+
+================================================
+FUNCION 3: file_list_add(list, path)
+================================================
+
+QUE HACE:
+  Agrega un nombre de archivo a la lista.
+  Si la lista esta llena, la duplica con realloc (igual que el heap).
+  Guarda una COPIA del string (con strdup).
+
+EJEMPLO:
+  list esta vacia.
+  file_list_add(list, "docs/hola.txt")
+  list.items[0] = "docs/hola.txt"
+  list.count = 1
+
+
+================================================
+FUNCION 4: collect_files_recursive(base_dir, rel_dir, list)
+================================================
+
+QUE HACE:
+  Esta funcion es un EXPLORADOR. Entra a una carpeta, mira todo lo
+  que hay adentro, y si encuentra subcarpetas entra a ellas tambien.
+  Cuando encuentra un archivo de texto, lo agrega a la lista.
+
+  Es RECURSIVA: se llama a si misma para explorar subcarpetas.
+
+EJEMPLO:
+  Tienes esta estructura:
+    mi_carpeta/
+      hola.txt
+      notas.md
+      fotos/          <- subcarpeta
+        vacaciones/   <- sub-subcarpeta
+          lista.txt
+
+  collect_files_recursive("mi_carpeta", "", list)
+    -> encuentra hola.txt    -> es texto -> lo agrega
+    -> encuentra notas.md    -> es texto -> lo agrega
+    -> encuentra fotos/      -> es carpeta -> entra recursivamente
+         -> encuentra vacaciones/ -> es carpeta -> entra recursivamente
+              -> encuentra lista.txt -> es texto -> lo agrega
+
+  Al final la lista tiene:
+    ["hola.txt", "notas.md", "fotos/vacaciones/lista.txt"]
+
+  OJO: guarda rutas RELATIVAS a la carpeta base, no absolutas.
+  Eso es importante para reconstruirlas igual al descomprimir.
+
+COMO FUNCIONA POR DENTRO:
+  1. Abre la carpeta con opendir().
+  2. Lee entrada por entrada con readdir().
+  3. Ignora "." y ".." (son carpetas especiales del sistema).
+  4. Para cada entrada:
+       - Si es carpeta: se llama a si misma (recursion)
+       - Si es archivo de texto: lo agrega a la lista
+  5. Cierra la carpeta con closedir().
+
+
+================================================
+FUNCION 5: compute_frequencies(filepath, freq, original_size)
+================================================
+
+QUE HACE:
+  Lee el archivo de texto byte por byte y cuenta cuantas veces
+  aparece cada byte posible (del 0 al 255).
+
+  Al terminar, freq[i] tiene cuantas veces aparecio el byte i.
+  Tambien cuenta el tamaño total del archivo (original_size).
+
+EJEMPLO:
+  Archivo contiene: "aabbc"
+
+  freq['a'] = 2
+  freq['b'] = 2
+  freq['c'] = 1
+  todos los demas = 0
+  original_size = 5
+
+POR QUE LO NECESITAMOS:
+  Esta tabla de frecuencias es la que le pasamos a build_huffman_tree
+  para construir el arbol. Sin saber cuantas veces aparece cada letra,
+  no podemos construir el arbol optimo.
+
+  Ademas la guardamos en el archivo comprimido para que el
+  descompresor pueda reconstruir el mismo arbol exacto.
+
+COMO LEE EL ARCHIVO:
+  No lee de a un byte porque seria muy lento. Lee bloques grandes
+  de IO_BUF_SIZE bytes a la vez (8192 bytes). Mucho mas eficiente.
+
+
+================================================
+FUNCION 6: compress_one_file(out, base_dir, rel_path)
+================================================
+
+QUE HACE:
+  Esta es la funcion mas importante del archivo. Toma UN archivo
+  de texto y lo comprime dentro del archivo .bin de salida.
+
+  Lo que escribe al .bin para cada archivo:
+
+  [largo de la ruta]  <- 2 bytes (uint16)
+  [la ruta relativa]  <- el texto de la ruta, ej: "docs/hola.txt"
+  [tamaño original]   <- 8 bytes (uint64), cuantos bytes tenia
+  [tabla freq x256]   <- 256 * 8 bytes, las frecuencias de cada byte
+  [bits comprimidos]  <- los datos comprimidos con Huffman
+
+PASO A PASO:
+
+  1. Llama a compute_frequencies() para contar cuantas veces
+     aparece cada byte en el archivo.
+
+  2. Llama a build_huffman_tree() para construir el arbol
+     usando esas frecuencias.
+
+  3. Llama a build_codes() para saber que codigo binario
+     le corresponde a cada letra.
+
+  4. Escribe en el .bin:
+       - el largo de la ruta  (para saber cuanto leer al descomprimir)
+       - la ruta relativa     (para reconstruir el archivo en el lugar correcto)
+       - el tamaño original   (para saber cuando parar al descomprimir)
+       - la tabla de frecuencias completa (para reconstruir el arbol)
+
+  5. Abre el archivo original de nuevo y lo lee byte por byte.
+     Para cada byte, escribe su codigo Huffman al .bin usando
+     bit_writer_write_bits().
+
+  6. Al terminar, llama a bit_writer_flush() para escribir los
+     bits que quedaron sin completar un byte.
+
+  7. Libera el arbol de la memoria.
+
+EJEMPLO con "aabbc":
+
+  freq: a=2, b=2, c=1
+  arbol:        [5]
+               /   \
+             [3]    c=1... (etc.)
+
+  codes: a=00, b=01, c=1 (por ejemplo)
+
+  El archivo "aabbc" comprimido seria:
+  a  a  b  b  c
+  00 00 01 01 1
+  = 00000101 1...  (rellenado con ceros al final)
+  = 2 bytes en vez de 5 originales!
+
+
+================================================
+COMO SE VE EL ARCHIVO .BIN POR DENTRO
+================================================
+
+  [HUF1]                     <- 4 bytes: firma magica
+  [cantidad de archivos]     <- 4 bytes: cuantos archivos hay
+
+  --- por cada archivo ---
+  [largo ruta]               <- 2 bytes
+  [ruta relativa]            <- N bytes (el largo que dijimos)
+  [tamaño original]          <- 8 bytes
+  [freq[0]]                  <- 8 bytes
+  [freq[1]]                  <- 8 bytes
+  ...
+  [freq[255]]                <- 8 bytes  (256 * 8 = 2048 bytes en total)
+  [bits comprimidos]         <- variable, los datos comprimidos
+  --- fin de archivo ---
+
+  Y se repite para cada archivo que habia en la carpeta.
+
+
+================================================
+ORDEN EN QUE SE LLAMAN LAS FUNCIONES
+================================================
+
+main()
+  |
+  +-> file_list_init()
+  |
+  +-> collect_files_recursive()    <- encuentra todos los archivos
+  |     +-> file_list_add()        <- los va agregando a la lista
+  |
+  +-> fopen() el archivo de salida
+  +-> fwrite() la firma HUF1
+  +-> write_u32() cantidad de archivos
+  |
+  +-> [para cada archivo en la lista]:
+  |     compress_one_file()
+  |       +-> compute_frequencies()     <- cuenta bytes del archivo
+  |       +-> build_huffman_tree()      <- construye el arbol
+  |       +-> build_codes()             <- genera los codigos binarios
+  |       +-> write_u16() ruta len      <- escribe cabecera al .bin
+  |       +-> fwrite() ruta
+  |       +-> write_u64() tamaño
+  |       +-> write_u64() x256 freqs   <- escribe tabla de frecuencias
+  |       +-> bit_writer_init()
+  |       +-> bit_writer_write_bits()  <- escribe datos comprimidos
+  |       +-> bit_writer_flush()
+  |       +-> free_huffman_tree()
+  |
+  +-> fclose() el archivo de salida
+  +-> file_list_free()
+  +-> imprime "Archivo generado!"
+
+
+================================================
+RESUMEN EN 5 LINEAS
+================================================
+
+1. Explora la carpeta y encuentra todos los archivos de texto.
+2. Por cada archivo, cuenta cuantas veces aparece cada letra.
+3. Construye el arbol Huffman para saber que codigo usar.
+4. Escribe el archivo comprimido con la info necesaria para
+   reconstruirlo despues.
+5. Guarda todo en un solo .bin listo para descomprimir.

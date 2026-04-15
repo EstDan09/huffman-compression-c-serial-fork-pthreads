@@ -1,0 +1,358 @@
+========================================================================
+  PROYECTO 0 — COMPRESOR/DESCOMPRESOR HUFFMAN
+  Serial · Paralelo (fork) · Concurrente (pthread)
+========================================================================
+
+DESCRIPCION GENERAL
+───────────────────
+Implementa compresion/descompresion lossless usando codificacion de Huffman.
+Se comprime un directorio entero (todos los archivos .txt, .md, .csv, .json,
+.xml, .html, .log) en un solo archivo binario .bin.  El formato mantiene la
+estructura de subdirectorios al descomprimir.
+
+El proyecto tiene TRES versiones que producen resultados identicos:
+  1. serial/     — ejecucion secuencial pura
+  2. parallel/   — paralelismo real con fork()
+  3. concurrent/ — concurrencia con pthread
+
+Todas las versiones miden y reportan el tiempo de ejecucion en milisegundos.
+
+
+ESTRUCTURA DE DIRECTORIOS
+─────────────────────────
+proyecto0/
+├── serial/
+│   ├── huffman.h       — tipos y declaraciones compartidas
+│   ├── huffman.c       — arbol Huffman, BitWriter/BitReader, helpers
+│   ├── compress.c      — compresor serial
+│   ├── decompress.c    — descompresor serial
+│   └── Makefile
+├── parallel/
+│   ├── huffman.h/c     — copia identica al serial
+│   ├── compress.c      — compresor con fork()
+│   ├── decompress.c    — descompresor con fork()
+│   └── Makefile
+├── concurrent/
+│   ├── huffman.h/c     — copia identica al serial
+│   ├── compress.c      — compresor con pthread
+│   ├── decompress.c    — descompresor con pthread
+│   └── Makefile
+├── test_input/         — archivos de prueba
+│   ├── texto1.txt
+│   ├── texto2.txt
+│   └── subdir/
+│       └── texto3.txt
+└── test_all.sh         — script que compila y prueba todo
+
+
+FORMATO DEL ARCHIVO .BIN
+─────────────────────────
+El archivo generado sigue este esquema secuencial:
+
+  [4 bytes]  magic = "HUF1"
+  [4 bytes]  file_count (uint32, cantidad de archivos)
+
+  Por cada archivo:
+    [2 bytes]     path_len  (longitud de la ruta relativa)
+    [path_len]    rel_path  (ruta relativa, sin terminador nulo)
+    [8 bytes]     original_size (uint64, bytes originales)
+    [256 * 8]     freq[256] (uint64 por byte, tabla de frecuencias)
+    [N bytes]     datos comprimidos (bits Huffman, padding al ultimo byte)
+
+Los enteros se guardan en el endianness nativo de la maquina (fwrite directo).
+La tabla de frecuencias se guarda en el .bin para que el descompresor pueda
+reconstruir el arbol Huffman sin informacion adicional.
+
+
+COMO FUNCIONA LA COMPRESION HUFFMAN
+─────────────────────────────────────
+1. Contar frecuencias de cada byte (0-255) en el archivo.
+2. Construir un min-heap (cola de prioridad) con los bytes que aparecen.
+3. Extraer los dos nodos de menor frecuencia, crear un nodo interno cuya
+   frecuencia es la suma, reinsertar. Repetir hasta que quede un solo nodo:
+   la raiz del arbol.
+4. Recorrer el arbol: ir a la izquierda agrega un '0', a la derecha un '1'.
+   Cada hoja recibe el codigo de bits del camino desde la raiz.
+5. Reescribir el archivo sustituyendo cada byte por su codigo de bits.
+6. Los bits se empaquetan en bytes (padding con ceros al final si necesario).
+
+La descompresion reconstruye el arbol desde freq[256] y recorre el arbol
+bit a bit hasta recuperar exactamente original_size bytes.
+
+
+VERSION SERIAL
+──────────────
+Flujo de compress.c:
+  main → collect_files_recursive → loop compress_one_file → ensambla .bin
+
+Flujo de decompress.c:
+  main → lee header → loop decode_file (secuencial)
+
+No hay paralelismo ni concurrencia. Es el baseline para comparar tiempos.
+
+Compilar:
+  cd serial && make
+
+Correr:
+  ./compress  <directorio_entrada> <salida.bin>
+  ./decompress <salida.bin> <directorio_salida>
+
+Ejemplo:
+  ./compress  ../test_input ../out/serial.bin
+  ./decompress ../out/serial.bin ../out/serial_out/
+
+
+VERSION PARALELA (fork)
+────────────────────────
+Usa fork() — cada hijo es un proceso independiente con su propio espacio
+de memoria.  El padre no comparte memoria con los hijos (copy-on-write).
+
+COMPRESS — estrategia:
+  1. El padre recolecta la lista de archivos.
+  2. El padre crea rutas de archivos temporales:
+       /tmp/huff_<PID_padre>_<indice>
+  3. El padre hace fork() por cada archivo.
+     Cada HIJO:
+       - Abre su archivo temporal para escritura.
+       - Llama a compress_one_file() — escribe solo los bytes de ese archivo.
+       - Hace exit(0) si exito, exit(1) si error.
+  4. El padre hace waitpid() por cada hijo y verifica exit status.
+  5. El padre ensambla el .bin final:
+       - Escribe header (HUFF_MAGIC + file_count)
+       - Lee cada archivo temporal en orden y lo copia al .bin
+       - Elimina los archivos temporales con unlink()
+
+  REGION CRITICA en compress:
+    No existe durante la compresion paralela — cada hijo escribe en su
+    propio archivo temporal.  La asamblea final la hace solo el padre
+    (proceso unico en ese punto), por lo que tampoco hay contension.
+
+DECOMPRESS — estrategia:
+  1. El padre lee el .bin completo y carga todos los bloques en memoria:
+       { rel_path, original_size, freq[256], data[], data_len }
+     Para saber cuantos bytes ocupa cada bloque comprimido, reconstruye
+     el arbol Huffman y suma freq[i]*len(codigo_i) bits, luego divide
+     entre 8 con redondeo hacia arriba.
+  2. El padre hace fork() por cada archivo.
+     Cada HIJO:
+       - Tiene su propia copia del array en memoria (copy-on-write).
+       - Crea un FILE* de lectura sobre block->data usando fmemopen().
+       - Reconstruye el arbol Huffman y decodifica original_size bytes.
+       - Escribe el archivo de salida.
+       - exit(0) o exit(1).
+  3. El padre hace waitpid() por todos.
+
+  REGION CRITICA en decompress:
+    Cada hijo escribe en un archivo diferente → no hay contension de
+    escritura.  El unico recurso compartido es stdout (printf), que en
+    procesos independientes puede intercalarse sin problema (atomicidad
+    de write() en el kernel para lineas cortas).
+
+Compilar:
+  cd parallel && make
+
+Correr:
+  ./compress  <directorio_entrada> <salida.bin>
+  ./decompress <salida.bin> <directorio_salida>
+
+Ejemplo:
+  ./compress  ../test_input ../out/parallel.bin
+  ./decompress ../out/parallel.bin ../out/parallel_out/
+
+
+VERSION CONCURRENTE (pthread)
+──────────────────────────────
+Usa pthread — los hilos comparten el espacio de memoria del proceso padre.
+Esto hace que las regiones criticas sean mas importantes que en fork.
+
+COMPRESS — estrategia:
+  1. El hilo principal recolecta la lista de archivos.
+  2. Se crea un array de CompressArg, uno por archivo:
+       { base_dir, rel_path, out_buf=NULL, out_size=0, success, *print_mutex }
+  3. El hilo principal lanza un pthread por archivo.
+     Cada HILO:
+       - Llama a open_memstream(&arg->out_buf, &arg->out_size) para obtener
+         un FILE* que escribe en un buffer dinamico en memoria.
+       - Llama a compress_one_file() — escribe en ese FILE*.
+       - Hace fclose() — esto finaliza el buffer y actualiza out_size.
+       - Protege el printf con pthread_mutex_lock(print_mutex).  ← RC
+  4. El hilo principal hace pthread_join() por todos los hilos.
+  5. El hilo principal ensambla el .bin:
+       - Escribe header (HUFF_MAGIC + file_count)
+       - Para cada hilo, escribe arg->out_buf (tamaño arg->out_size) al .bin
+       - Libera cada buffer con free()
+
+  REGIONES CRITICAS en compress:
+    - out_buf / out_size: cada hilo escribe en su PROPIO buffer (open_memstream
+      crea buffers independientes), no hay contension → NO necesita mutex.
+    - stdout (printf): si dos hilos hacen printf al mismo tiempo, las lineas
+      pueden intercalarse de forma incorrecta.  Se protege con print_mutex.
+    - El FILE* out final: lo escribe SOLO el hilo principal tras el join,
+      no hay contension → NO necesita mutex.
+
+DECOMPRESS — estrategia:
+  1. El hilo principal lee el .bin y carga todos los bloques en memoria
+     (igual que en parallel/decompress.c — carga secuencial obligatoria).
+  2. El hilo principal lanza un pthread por archivo.
+     Cada HILO:
+       - Crea un FILE* de solo lectura sobre block->data con fmemopen().
+       - Reconstruye el arbol Huffman y decodifica original_size bytes.
+       - Escribe su propio archivo de salida.
+       - Protege el printf con print_mutex.  ← RC
+  3. El hilo principal hace pthread_join() por todos.
+
+  REGIONES CRITICAS en decompress:
+    - Lectura de block->data: solo lectura, no hay contension.
+    - Escritura a archivos de salida: cada hilo escribe en un archivo
+      distinto → no hay contension entre hilos.
+    - ensure_parent_dirs(): puede llamarse concurrentemente sobre el mismo
+      directorio.  mkdir() con EEXIST ya es tolerado, pero si dos hilos
+      intentan crear el mismo directorio al mismo tiempo puede haber
+      condicion de carrera.  Para este proyecto con 3 archivos de prueba
+      el riesgo es bajo, pero en produccion se protegeria con mutex o se
+      pre-crearian los directorios antes de lanzar los hilos.
+    - stdout: protegido con print_mutex.
+
+Compilar:
+  cd concurrent && make      (enlaza con -lpthread automaticamente)
+
+Correr:
+  ./compress  <directorio_entrada> <salida.bin>
+  ./decompress <salida.bin> <directorio_salida>
+
+Ejemplo:
+  ./compress  ../test_input ../out/concurrent.bin
+  ./decompress ../out/concurrent.bin ../out/concurrent_out/
+
+
+COMPILAR TODO DE UNA VEZ
+─────────────────────────
+Desde proyecto0/:
+  (cd serial     && make)
+  (cd parallel   && make)
+  (cd concurrent && make)
+
+O usar el script de test que compila todo automaticamente:
+  bash test_all.sh
+
+
+PROBAR TODO DE UNA VEZ (RECOMENDADO)
+──────────────────────────────────────
+  bash test_all.sh
+
+El script:
+  1. Compila las tres versiones.
+  2. Comprime test_input/ con cada version → test_output/<version>/resultado.bin
+  3. Descomprime cada .bin         → test_output/<version>/recuperado/
+  4. Compara test_input/ con cada recuperado/ usando diff -r.
+  5. Reporta IGUAL o DIFERENTE por version.
+  6. Muestra los tamaños de los tres .bin (deben ser iguales).
+
+
+PRUEBAS MANUALES PASO A PASO
+──────────────────────────────
+# Desde proyecto0/
+
+# --- Serial ---
+cd serial && make
+./compress  ../test_input ../out_serial.bin
+./decompress ../out_serial.bin ../out_serial/
+diff -r ../test_input ../out_serial/
+cd ..
+
+# --- Parallel ---
+cd parallel && make
+./compress  ../test_input ../out_parallel.bin
+./decompress ../out_parallel.bin ../out_parallel/
+diff -r ../test_input ../out_parallel/
+cd ..
+
+# --- Concurrent ---
+cd concurrent && make
+./compress  ../test_input ../out_concurrent.bin
+./decompress ../out_concurrent.bin ../out_concurrent/
+diff -r ../test_input ../out_concurrent/
+cd ..
+
+# --- Comparar los tres .bin (deben ser byte-identicos si el orden de
+#     archivos es el mismo — puede variar por orden de readdir) ---
+cmp out_serial.bin out_parallel.bin   && echo "serial==parallel" || echo "distinto (puede ser normal)"
+cmp out_serial.bin out_concurrent.bin && echo "serial==concurrent" || echo "distinto (puede ser normal)"
+
+NOTA SOBRE ORDEN DE ARCHIVOS:
+  El serial y el concurrent preservan el orden de recoleccion de archivos
+  (readdir).  El parallel tambien — fork lanza hijos en orden, pero los
+  archivos temporales se ensamblan en orden.
+  Por lo tanto los tres .bin deben ser identicos.  Si hay diferencia de
+  orden (distinto filesystem), diff -r sobre los directorios descomprimidos
+  siempre debe dar igual, que es lo que realmente importa.
+
+
+AGREGAR TUS PROPIOS ARCHIVOS DE PRUEBA
+────────────────────────────────────────
+Cualquier archivo con extension .txt, .md, .csv, .json, .xml, .html o .log
+dentro de test_input/ sera procesado automaticamente.  Puedes crear
+subdirectorios — la estructura se replica en la descompresion.
+
+Ejemplo:
+  echo "hola mundo" > test_input/prueba_extra.txt
+  bash test_all.sh
+
+
+COMO MEDIR Y COMPARAR TIEMPOS
+──────────────────────────────
+Cada programa imprime al final:
+  Tiempo de ejecucion: X ms
+
+Para obtener tiempos mas estables, correr varias veces y promediar:
+  for i in 1 2 3 4 5; do ./serial/compress test_input/ /tmp/s.bin; done
+
+Para archivos grandes (donde la diferencia es visible), copiar un directorio
+grande con muchos archivos de texto a test_input/ antes de medir.
+
+Nota: con pocos archivos pequenos (como los 3 de test_input), el overhead de
+fork/pthread puede hacer que serial sea MAS RAPIDO que las otras versiones.
+La ventaja del paralelismo se nota con muchos archivos o archivos grandes.
+
+
+DEPENDENCIAS Y COMPATIBILIDAD
+──────────────────────────────
+- gcc (cualquier version reciente)
+- POSIX: fork, waitpid, pthread, fmemopen, clock_gettime
+- macOS (Darwin) y Linux: totalmente compatible
+- Windows: NO compatible (usa APIs POSIX no disponibles en Win32)
+- fmemopen requiere: macOS >= 10.13 o Linux con glibc >= 2.7
+
+Para macOS, si clock_gettime falla (muy raro en sistemas modernos), se puede
+reemplazar con gettimeofday() — pero no deberia ser necesario en Darwin 25+.
+
+
+GLOSARIO RAPIDO
+───────────────
+fork()        Crea un proceso hijo copia del padre.  Retorna 0 al hijo,
+              PID-del-hijo al padre.  El hijo hereda memoria (CoW), FDs, etc.
+
+waitpid()     El padre espera a que un hijo especifico termine.
+              WIFEXITED(s) + WEXITSTATUS(s) dan el codigo de retorno.
+
+pthread_create()  Crea un hilo en el mismo proceso.  Comparte memoria.
+
+pthread_join()    Espera a que un hilo termine.  Equivalente a waitpid.
+
+pthread_mutex     Variable de exclusion mutua.  lock/unlock garantizan que
+                  solo un hilo ejecuta la region critica a la vez.
+
+fmemopen()    Crea un FILE* que lee desde un buffer en memoria.  Util para
+              pasar datos entre procesos/hilos sin archivos temporales en disco.
+
+open_memstream()  Crea un FILE* que escribe en un buffer dinamico (crece
+                  automaticamente).  El buffer queda accesible tras fclose().
+
+Huffman tree  Arbol binario optimo para compresion de entropia.  Los simbolos
+              mas frecuentes reciben codigos mas cortos.
+
+BitWriter     Acumula bits en un buffer de 1 byte y los vuelca al FILE*
+              cuando el byte se llena (cada 8 bits).
+
+BitReader     Lee bytes del FILE* y los entrega bit a bit.
+========================================================================
