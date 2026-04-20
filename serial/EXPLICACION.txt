@@ -1,0 +1,377 @@
+========================================================================
+  VERSION SERIAL — compress.c / decompress.c
+  Huffman Compressor/Descompressor — Ejecucion secuencial pura
+========================================================================
+
+No hay procesos hijos ni hilos. Todo ocurre en un unico flujo de control,
+instruccion tras instruccion, archivo tras archivo.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  STRUCTS UTILIZADOS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+──────────────────────────────────────────────
+FileList  (definida en compress.c)
+──────────────────────────────────────────────
+  char  **items     → array de punteros a strings (rutas relativas)
+  size_t  count     → cuantas rutas hay actualmente
+  size_t  capacity  → cuantas rutas caben antes de hacer realloc
+
+  Proposito: acumular dinamicamente las rutas de todos los archivos
+  de texto encontrados en el directorio de entrada.  Crece al doble
+  cuando se llena (estrategia amortizada O(1) por insercion).
+
+──────────────────────────────────────────────
+HuffmanNode  (definida en huffman.h)
+──────────────────────────────────────────────
+  unsigned char  byte     → byte que representa este nodo (solo si is_leaf)
+  uint64_t       freq     → frecuencia acumulada (hojas: freq del byte;
+                             nodos internos: suma de hijos)
+  HuffmanNode   *left     → hijo izquierdo (bit 0)
+  HuffmanNode   *right    → hijo derecho   (bit 1)
+  int            is_leaf  → 1 si es hoja, 0 si es nodo interno
+
+  Proposito: nodo del arbol binario de Huffman.  Las hojas representan
+  bytes reales del archivo.  Los nodos internos solo agrupan frecuencias.
+
+──────────────────────────────────────────────
+HuffCode  (definida en huffman.h)
+──────────────────────────────────────────────
+  uint64_t  bits    → los bits del codigo (guardados en los bits menos
+                       significativos, de izquierda a derecha)
+  uint8_t   length  → cuantos bits tiene el codigo (0 a 64)
+
+  Proposito: tabla de codigos.  Se crea un array HuffCode codes[256],
+  donde codes[b] guarda el codigo Huffman del byte b.
+
+──────────────────────────────────────────────
+BitWriter  (definida en huffman.h)
+──────────────────────────────────────────────
+  uint8_t  buffer     → byte en construccion (se llena bit a bit)
+  int      bit_count  → cuantos bits ya se escribieron en buffer (0-7)
+  FILE    *fp         → archivo de salida
+
+  Proposito: escribir bits individuales al archivo de salida empaquetados
+  en bytes.  Cuando bit_count llega a 8 se hace fputc y se reinicia.
+
+──────────────────────────────────────────────
+BitReader  (definida en huffman.h)
+──────────────────────────────────────────────
+  uint8_t  buffer     → byte leido actualmente (se consume bit a bit)
+  int      bit_count  → cuantos bits quedan en buffer (0-8)
+  FILE    *fp         → archivo de entrada
+
+  Proposito: leer bits individuales del archivo de entrada.  Lee un byte
+  entero con fgetc cuando el buffer se agota, y lo entrega bit a bit.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  compress.c — FUNCIONES Y ORDEN DE EJECUCION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Diagrama de llamadas:
+  main
+   ├─ clock_gettime (inicio)
+   ├─ file_list_init
+   ├─ collect_files_recursive  (recursiva sobre subdirectorios)
+   │   └─ file_list_add
+   ├─ fopen (archivo .bin de salida)
+   ├─ fwrite HUFF_MAGIC + write_u32 (header)
+   ├─ [loop por cada archivo]
+   │   └─ compress_one_file
+   │       ├─ compute_frequencies
+   │       ├─ build_huffman_tree    (huffman.c)
+   │       ├─ build_codes           (huffman.c)
+   │       ├─ write_u16 / fwrite / write_u64 x257  (metadatos al .bin)
+   │       ├─ bit_writer_init
+   │       ├─ [loop fread del archivo fuente]
+   │       │   └─ bit_writer_write_bits
+   │       ├─ bit_writer_flush
+   │       └─ free_huffman_tree
+   ├─ fclose
+   ├─ file_list_free
+   └─ clock_gettime (fin) → imprime tiempo
+
+──────────────────────────────────────────────
+file_list_init(FileList *list)
+──────────────────────────────────────────────
+  Inicializa la lista vacia: items=NULL, count=0, capacity=0.
+  Debe llamarse antes de cualquier uso de la lista.
+
+──────────────────────────────────────────────
+file_list_free(FileList *list)
+──────────────────────────────────────────────
+  Libera cada string en items[] con free(), luego libera el array.
+  Llamada al final de main para evitar leaks.
+
+──────────────────────────────────────────────
+file_list_add(FileList *list, const char *path)  → int
+──────────────────────────────────────────────
+  Si la lista esta llena (count == capacity), duplica el array con
+  realloc (capacidad inicial 16, luego 32, 64, ...).
+  Copia el path con strdup y lo inserta en items[count++].
+  Retorna 1 si exito, 0 si fallo de memoria.
+
+──────────────────────────────────────────────
+collect_files_recursive(base_dir, rel_dir, list)  → int
+──────────────────────────────────────────────
+  Abre el directorio base_dir/rel_dir con opendir().
+  Para cada entrada de readdir():
+    - Si es directorio: se llama recursivamente con la nueva ruta relativa.
+    - Si es archivo regular y tiene extension de texto (.txt, .md, .csv,
+      .json, .xml, .html, .log): llama a file_list_add con la ruta relativa.
+  Las rutas guardadas son RELATIVAS al directorio base (ej: "subdir/libro.txt").
+  Esto permite reconstruir la estructura de directorios al descomprimir.
+  Retorna 1 si todo fue bien, 0 si hubo un error de apertura.
+
+──────────────────────────────────────────────
+compute_frequencies(filepath, freq[256], *original_size)  → int
+──────────────────────────────────────────────
+  Abre el archivo en modo binario.
+  Lee en bloques de IO_BUF_SIZE (8192) bytes con fread.
+  Por cada byte leido incrementa freq[byte] y suma al total.
+  Al cerrar, freq[] tiene cuantas veces aparece cada byte (0-255) y
+  *original_size tiene el tamaño total del archivo en bytes.
+  No modifica el archivo.
+
+──────────────────────────────────────────────
+compress_one_file(FILE *out, base_dir, rel_path)  → int
+──────────────────────────────────────────────
+  Es la funcion central de compresion.  Escribe todo lo de un archivo
+  al FILE *out (que ya esta abierto y posicionado).
+
+  Paso 1 — Metadatos:
+    Llama a compute_frequencies para obtener freq[] y original_size.
+    Construye el arbol Huffman con build_huffman_tree(freq).
+    Genera la tabla de codigos con build_codes(root, codes, 0, 0).
+    Escribe al FILE *out:
+      - path_len  (uint16_t, 2 bytes)
+      - rel_path  (path_len bytes, sin '\0')
+      - original_size  (uint64_t, 8 bytes)
+      - freq[0..255]   (256 * uint64_t = 2048 bytes)
+    Total de metadatos por archivo: 2 + path_len + 8 + 2048 bytes.
+
+  Paso 2 — Datos comprimidos:
+    Reabre el mismo archivo para leerlo.
+    Inicializa un BitWriter sobre el mismo FILE *out.
+    Lee el archivo en bloques de 8192 bytes.
+    Por cada byte b del archivo, llama:
+      bit_writer_write_bits(bw, codes[b].bits, codes[b].length)
+    Esto empaqueta los bits Huffman en bytes hacia out.
+    Al terminar llama bit_writer_flush para vaciar bits pendientes.
+    Libera el arbol con free_huffman_tree.
+
+──────────────────────────────────────────────
+main(argc, argv)
+──────────────────────────────────────────────
+  1. Valida argumentos (exactamente 3: programa, directorio, salida).
+  2. clock_gettime(CLOCK_MONOTONIC) → ts_start.
+  3. Inicializa y llena FileList con collect_files_recursive.
+  4. Abre el archivo .bin de salida en modo "wb" (binario escritura).
+  5. Escribe cabecera global:
+       "HUF1" (4 bytes magic) + file_count (uint32_t, 4 bytes).
+  6. Loop for i = 0..count-1:
+       compress_one_file(out, input_dir, list.items[i])
+       Si falla, cierra y sale con error.
+       Si exito, imprime "Comprimido: <ruta>".
+  7. Cierra out, libera la lista.
+  8. clock_gettime → ts_end.  Calcula (ts_end - ts_start) en ms.
+  9. Imprime nombre del archivo generado y tiempo de ejecucion.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  decompress.c — FUNCIONES Y ORDEN DE EJECUCION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Diagrama de llamadas:
+  main
+   ├─ clock_gettime (inicio)
+   ├─ MKDIR (crea directorio de salida)
+   ├─ fopen (.bin de entrada)
+   ├─ fread magic + read_u32 (valida header)
+   ├─ [loop por cada archivo]
+   │   └─ decode_file
+   │       ├─ read_u16 / fread / read_u64 / read_u64 x256 (metadatos)
+   │       ├─ ensure_parent_dirs
+   │       ├─ fopen (archivo de salida)
+   │       ├─ build_huffman_tree
+   │       ├─ bit_reader_init
+   │       └─ [loop original_size veces]
+   │           ├─ bit_reader_read_bit
+   │           └─ fputc (escribe byte decodificado)
+   ├─ fclose
+   └─ clock_gettime (fin) → imprime tiempo
+
+──────────────────────────────────────────────
+decode_file(FILE *in, const char *output_dir)  → int
+──────────────────────────────────────────────
+  Lee el bloque de un archivo del stream in (que apunta al inicio del
+  siguiente archivo en el .bin).  El stream avanza automaticamente.
+
+  Paso 1 — Leer metadatos:
+    read_u16  → path_len
+    fread     → rel_path (path_len bytes)
+    read_u64  → original_size
+    read_u64 x256 → freq[0..255]
+
+  Paso 2 — Preparar salida:
+    Construye la ruta completa: output_dir + "/" + rel_path.
+    Llama a ensure_parent_dirs para crear subdirectorios si no existen.
+    Abre el archivo de salida con fopen en modo "wb".
+
+  Paso 3 — Decodificar:
+    Si original_size == 0: cierra y retorna (archivo vacio).
+    Reconstruye el arbol con build_huffman_tree(freq).
+    Inicializa BitReader sobre el mismo FILE *in.
+    Caso especial (un solo simbolo unico):
+      Si root->left existe pero root->right no, el unico byte se escribe
+      original_size veces con fputc, y se consumen los bits de padding.
+    Caso normal:
+      Loop original_size veces:
+        Parte de la raiz del arbol.
+        Lee bits con bit_reader_read_bit: 0 va a la izquierda, 1 a la derecha.
+        Cuando llega a una hoja, escribe root->byte con fputc al archivo.
+    Libera el arbol.  Cierra el archivo de salida.
+
+  OBSERVACION: el FILE *in avanza su posicion conforme se leen metadatos
+  y bits comprimidos.  Esto es posible porque el formato del .bin es
+  estrictamente secuencial: un bloque por archivo, sin offsets ni saltos.
+
+──────────────────────────────────────────────
+main(argc, argv)
+──────────────────────────────────────────────
+  1. Valida argumentos.
+  2. clock_gettime → ts_start.
+  3. MKDIR(output_dir) — crea el directorio raiz de salida.
+  4. fopen el .bin de entrada en modo "rb".
+  5. Lee y valida magic "HUF1" (si no coincide, error).
+  6. Lee file_count (uint32_t).
+  7. Loop for i = 0..file_count-1:
+       decode_file(in, output_dir)
+       Si falla, cierra y sale con error.
+  8. fclose.
+  9. clock_gettime → ts_end.  Imprime tiempo en ms.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  huffman.c — FUNCIONES DEL MODULO COMPARTIDO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+──────────────────────────────────────────────
+build_huffman_tree(freq[256])  → HuffmanNode*
+──────────────────────────────────────────────
+  Construye el arbol optimo de Huffman usando un min-heap.
+  1. Crea un nodo hoja por cada byte con freq > 0 y lo inserta al heap.
+  2. Mientras el heap tiene mas de un nodo:
+       Extrae los dos de menor frecuencia (left, right).
+       Crea un nodo interno con freq = left->freq + right->freq.
+       Lo inserta al heap.
+  3. El ultimo nodo del heap es la raiz.
+  Estructura del min-heap interno (MinHeap):
+    HuffmanNode **data  → array dinamico de punteros
+    size_t size         → cuantos nodos hay
+    size_t capacity     → tamaño del array
+  heap_push: inserta y hace sift-up (comparando freq).
+  heap_pop:  extrae el minimo, pone el ultimo en [0], hace sift-down.
+
+──────────────────────────────────────────────
+build_codes(root, codes[256], bits, length)
+──────────────────────────────────────────────
+  Recorre el arbol en preorden (DFS recursivo).
+  Al ir a la izquierda: bits = (bits << 1) | 0, length++.
+  Al ir a la derecha:   bits = (bits << 1) | 1, length++.
+  Cuando llega a una hoja: codes[root->byte] = {bits, length}.
+  Caso especial: si la raiz ya es hoja (un solo byte unico),
+  length=0 y se escribe con cero bits por caracter.
+
+──────────────────────────────────────────────
+free_huffman_tree(root)
+──────────────────────────────────────────────
+  Postorden recursivo: libera hijos antes que el padre.
+  Llama a free() sobre cada HuffmanNode.
+
+──────────────────────────────────────────────
+bit_writer_init / write_bits / flush
+──────────────────────────────────────────────
+  init:       inicializa buffer=0, bit_count=0.
+  write_bits: recorre los bits de 'bits' de MSB a LSB, los mete al buffer.
+              Cuando bit_count llega a 8, hace fputc y reinicia.
+  flush:      si quedan bits (bit_count > 0), los rellena con 0 por la
+              derecha y hace fputc para escribir el ultimo byte parcial.
+
+──────────────────────────────────────────────
+bit_reader_init / read_bit
+──────────────────────────────────────────────
+  init:     inicializa buffer=0, bit_count=0.
+  read_bit: si bit_count==0, lee un byte con fgetc (llena el buffer).
+            Extrae el bit mas significativo (0x80), desplaza buffer a la
+            izquierda, decrementa bit_count.
+            Retorna 0 o 1.  Retorna -1 en EOF.
+
+──────────────────────────────────────────────
+write_u16 / write_u32 / write_u64
+read_u16  / read_u32  / read_u64
+──────────────────────────────────────────────
+  Wrappers de fwrite/fread para enteros de 2, 4 y 8 bytes.
+  Usan el endianness nativo de la maquina.
+  Retornan 1 si exito, 0 si fallo.
+
+──────────────────────────────────────────────
+is_text_file(name)  → int
+──────────────────────────────────────────────
+  Busca el ultimo '.' en el nombre con strrchr.
+  Retorna 1 si la extension es .txt, .md, .csv, .json, .xml, .html o .log.
+  Retorna 0 en cualquier otro caso (incluye archivos sin extension).
+
+──────────────────────────────────────────────
+ensure_parent_dirs(filepath)  → int
+──────────────────────────────────────────────
+  Recorre el path caracter a caracter buscando '/' o '\'.
+  Cada vez que encuentra un separador, termina el string ahi
+  temporalmente y llama a MKDIR().  Si MKDIR falla con EEXIST
+  (ya existe), lo ignora.  Esto crea la jerarquia completa de
+  directorios necesaria para el archivo de salida.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FLUJO COMPLETO DE compress (ejemplo con 3 archivos)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  [PROCESO UNICO]
+  Tiempo 0:  main inicia, toma timestamp
+  Tiempo 1:  collect_files_recursive → FileList = [a.txt, b.txt, sub/c.txt]
+  Tiempo 2:  fopen salida.bin
+  Tiempo 3:  escribe "HUF1" + 3
+  Tiempo 4:  compress_one_file(out, dir, "a.txt")
+               lee a.txt → freq[] → arbol → codigos
+               escribe metadatos de a.txt al .bin
+               relee a.txt → codifica bit a bit → escribe al .bin
+  Tiempo 5:  compress_one_file(out, dir, "b.txt")  [identico al anterior]
+  Tiempo 6:  compress_one_file(out, dir, "sub/c.txt")  [identico]
+  Tiempo 7:  fclose, file_list_free
+  Tiempo 8:  toma timestamp final, imprime tiempo
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FLUJO COMPLETO DE decompress (ejemplo con 3 archivos)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  [PROCESO UNICO]
+  Tiempo 0:  main inicia, toma timestamp
+  Tiempo 1:  MKDIR(output_dir)
+  Tiempo 2:  fopen salida.bin en modo lectura
+  Tiempo 3:  lee "HUF1" → valida.  Lee file_count = 3.
+  Tiempo 4:  decode_file(in, output_dir)  → recupera a.txt
+               lee metadatos de a.txt (path, size, freq[])
+               reconstruye arbol Huffman
+               lee bits del stream, decodifica caracter a caracter
+               escribe a.txt en el directorio de salida
+  Tiempo 5:  decode_file(in, output_dir)  → recupera b.txt
+  Tiempo 6:  decode_file(in, output_dir)  → recupera sub/c.txt
+  Tiempo 7:  fclose
+  Tiempo 8:  toma timestamp final, imprime tiempo
+
+  CLAVE: el mismo FILE *in avanza a traves del .bin completo.
+  Cada decode_file lo consume exactamente un bloque mas adelante.
+========================================================================
