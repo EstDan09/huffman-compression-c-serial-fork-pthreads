@@ -1,0 +1,448 @@
+========================================================================
+  VERSION CONCURRENTE — compress.c / decompress.c
+  Huffman Compressor/Descompressor — Concurrencia con pthread
+========================================================================
+
+Los hilos comparten el espacio de memoria del proceso padre.
+No hay copia de memoria como en fork: todo es acceso directo y
+simultaneo → las regiones criticas son obligatorias.
+
+API del sistema operativo usada:
+  pthread_create()        → crea un hilo dentro del mismo proceso
+  pthread_join()          → espera a que un hilo termine
+  pthread_mutex_lock()    → adquiere un mutex (bloquea si otro lo tiene)
+  pthread_mutex_unlock()  → libera el mutex
+  PTHREAD_MUTEX_INITIALIZER → inicializa un mutex estaticamente
+  open_memstream()        → FILE* que escribe en un buffer dinamico en RAM
+  fmemopen()              → FILE* que lee desde un buffer existente en RAM
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  STRUCTS UTILIZADOS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+──────────────────────────────────────────────
+FileList  (compress.c)
+──────────────────────────────────────────────
+  Igual a serial y parallel.  La usa el hilo principal para recolectar
+  archivos ANTES de crear hilos.  No hay acceso concurrente a ella.
+
+──────────────────────────────────────────────
+CompressArg  (compress.c)
+──────────────────────────────────────────────
+  const char      *base_dir      → directorio raiz de entrada (solo lectura)
+  const char      *rel_path      → ruta relativa del archivo a comprimir
+  char            *out_buf       → puntero al buffer comprimido resultante
+                                   (NULL al inicio, asignado por open_memstream)
+  size_t           out_size      → tamaño del buffer tras la compresion
+  int              success       → 1 si el hilo tuvo exito, 0 si fallo
+  pthread_mutex_t *print_mutex   → puntero al mutex compartido para stdout
+
+  Proposito: cada hilo recibe un puntero a SU CompressArg.
+  El hilo escribe en out_buf y out_size (campos propios → no hay
+  contension entre hilos porque cada hilo apunta a un elemento
+  diferente del array args[]).
+  El campo print_mutex es compartido (todos apuntan al mismo mutex).
+
+──────────────────────────────────────────────
+FileBlock  (decompress.c)
+──────────────────────────────────────────────
+  char         rel_path[4096]  → ruta relativa del archivo
+  uint64_t     original_size   → tamaño descomprimido en bytes
+  uint64_t     freq[256]       → tabla de frecuencias
+  uint8_t     *data            → bytes comprimidos (solo lectura por los hilos)
+  size_t       data_len        → longitud de data[]
+  HuffmanNode *tree            → arbol Huffman pre-construido (solo lectura)
+  int          success         → resultado del hilo (escrito por el hilo)
+  const char  *output_dir      → directorio de salida (solo lectura)
+  pthread_mutex_t *print_mutex → mutex compartido para stdout
+
+  Proposito: empaqueta todo lo que un hilo necesita para descomprimir
+  su archivo.  data y tree son de SOLO LECTURA para los hilos.
+  success es el unico campo que cada hilo MODIFICA (y es en su propio
+  elemento del array → no hay carrera de datos).
+
+──────────────────────────────────────────────
+HuffmanNode, HuffCode, BitWriter, BitReader
+──────────────────────────────────────────────
+  Identicos a serial.  En la version concurrente:
+  - En compress: cada hilo crea y destruye su propio arbol en su stack
+    y heap local → no se comparte con otros hilos.
+  - En decompress: el arbol se construye en el hilo PRINCIPAL y se
+    pasa a cada hilo via FileBlock.tree (solo lectura → sin mutex).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  compress.c — FUNCIONES Y ORDEN DE EJECUCION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Diagrama de llamadas:
+  main (HILO PRINCIPAL)
+   ├─ clock_gettime (inicio)
+   ├─ collect_files_recursive
+   ├─ PTHREAD_MUTEX_INITIALIZER  → print_mutex
+   ├─ calloc args[N]  +  malloc threads[N]
+   ├─ rellenar args[i].base_dir, rel_path, print_mutex
+   ├─ [loop pthread_create — lanza N hilos]
+   │   └─ [HILO i]  thread_compress(&args[i])
+   │           ├─ open_memstream(&args[i].out_buf, &args[i].out_size)
+   │           ├─ compress_one_file(mem_fp, base_dir, rel_path)
+   │           │   ├─ compute_frequencies
+   │           │   ├─ build_huffman_tree        ← cada hilo su propio heap
+   │           │   ├─ build_codes
+   │           │   ├─ write metadatos al mem_fp
+   │           │   ├─ bit_writer sobre mem_fp
+   │           │   └─ free_huffman_tree
+   │           ├─ fclose(mem_fp)  ← finaliza el buffer en memoria
+   │           ├─ pthread_mutex_lock(print_mutex)  ← RC: stdout
+   │           ├─ printf(...)
+   │           └─ pthread_mutex_unlock(print_mutex)
+   ├─ [loop pthread_join]
+   ├─ pthread_mutex_destroy
+   ├─ fopen salida.bin
+   ├─ fwrite HUFF_MAGIC + write_u32
+   ├─ [loop ensamblado — escribe args[i].out_buf al .bin]
+   │   ├─ fwrite(args[i].out_buf, args[i].out_size, out)
+   │   └─ free(args[i].out_buf)
+   ├─ fclose
+   ├─ free(args)  +  file_list_free
+   └─ clock_gettime (fin) → imprime tiempo
+
+──────────────────────────────────────────────
+thread_compress(void *arg)  → void*
+──────────────────────────────────────────────
+  Funcion de hilo.  Recibe un puntero a CompressArg.
+
+  Paso 1 — Crear buffer de salida en memoria:
+    open_memstream(&a->out_buf, &a->out_size) devuelve un FILE* especial.
+    Todo lo que se escriba en ese FILE* se acumula en un buffer dinamico
+    en RAM.  El buffer crece automaticamente si hace falta.
+    out_buf y out_size se actualizan SOLO cuando se hace fclose().
+
+  Paso 2 — Comprimir:
+    compress_one_file(mem_fp, base_dir, rel_path) escribe los bytes
+    comprimidos al FILE* de memoria.
+    Internamente esto usa:
+      compute_frequencies → lee el archivo fuente del disco.
+      build_huffman_tree  → alloca nodos Huffman en el heap del hilo.
+      build_codes         → recorre el arbol (stack local).
+      bit_writer_write_bits → escribe bits al mem_fp (buffer en RAM).
+    No hay acceso a datos compartidos en estos pasos → no se necesita mutex.
+
+  Paso 3 — Finalizar:
+    fclose(mem_fp): vacua el buffer, actualiza a->out_buf y a->out_size.
+    Despues de este punto, a->out_buf apunta a los bytes comprimidos
+    de este archivo y a->out_size es su longitud.
+
+  Paso 4 — Imprimir (REGION CRITICA):
+    pthread_mutex_lock(a->print_mutex)
+    printf(...)    ← solo un hilo a la vez puede ejecutar esta linea
+    pthread_mutex_unlock(a->print_mutex)
+    Sin el mutex, dos hilos podrian hacer printf al mismo tiempo y
+    las lineas se intercalarian de forma incorrecta en el terminal.
+
+──────────────────────────────────────────────
+compress_one_file  /  compute_frequencies  /  file_list_*
+──────────────────────────────────────────────
+  Identicas a serial.  Son thread-safe porque:
+  - Solo usan variables locales (stack) y punteros a datos propios del hilo.
+  - El FILE *out que reciben es el mem_fp privado de cada hilo.
+  - No modifican ningun estado global.
+
+──────────────────────────────────────────────
+main  — HILO PRINCIPAL
+──────────────────────────────────────────────
+  1. Valida argumentos.
+  2. clock_gettime → ts_start.
+  3. collect_files_recursive → FileList con N archivos.
+  4. Inicializa print_mutex con PTHREAD_MUTEX_INITIALIZER.
+  5. calloc(N, sizeof(CompressArg)) → args[].
+     malloc(N, sizeof(pthread_t)) → threads[].
+  6. Rellena args[i] con base_dir, rel_path, &print_mutex para cada i.
+  7. Loop pthread_create(i=0..N-1):
+       pthread_create(&threads[i], NULL, thread_compress, &args[i])
+       Si falla, hace join de los ya lanzados y sale.
+  8. Loop pthread_join(i=0..N-1):
+       Bloquea hasta que el hilo i termine.
+       Despues de este loop, args[i].out_buf y out_size estan disponibles.
+  9. pthread_mutex_destroy(&print_mutex).
+  10. Verifica que todos los hilos tuvieron success=1.
+  11. Abre el .bin de salida.
+  12. Escribe "HUF1" + file_count.
+  13. Loop ensamblado (i=0..N-1):
+        fwrite(args[i].out_buf, 1, args[i].out_size, out)
+        free(args[i].out_buf)
+      El ensamblado es secuencial y lo hace solo el hilo principal.
+      No hay contension en la escritura al .bin.
+  14. Cierra el .bin.  Libera memoria.
+  15. clock_gettime → ts_end.  Imprime tiempo.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  decompress.c — FUNCIONES Y ORDEN DE EJECUCION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Diagrama de llamadas:
+  main (HILO PRINCIPAL)
+   ├─ clock_gettime (inicio)
+   ├─ MKDIR(output_dir)
+   ├─ fopen .bin
+   ├─ leer magic + file_count
+   ├─ calloc blocks[N]
+   ├─ [loop lectura secuencial]
+   │   └─ compute_compressed_bytes(freq)
+   │       ├─ build_huffman_tree  (temporal, solo para calcular tamaño)
+   │       ├─ build_codes
+   │       └─ free_huffman_tree
+   ├─ fclose .bin
+   ├─ [loop pre-construccion de arboles — SERIAL, sin contension]
+   │   └─ blocks[i].tree = build_huffman_tree(blocks[i].freq)
+   ├─ [loop pthread_create — lanza N hilos]
+   │   └─ [HILO i]  thread_decode(&blocks[i])
+   │           ├─ ensure_parent_dirs
+   │           ├─ fopen (archivo de salida)
+   │           ├─ malloc(original_size) → decode_buf   ← buffer de decodif.
+   │           ├─ [decodificacion directa sobre blocks[i].data]
+   │           │   └─ macro READ_BIT → avanza puntero sobre data[]
+   │           │   └─ recorre blocks[i].tree
+   │           │   └─ decode_buf[w] = byte decodificado
+   │           ├─ fwrite(decode_buf, original_size, out)   ← 1 sola escritura
+   │           ├─ free(decode_buf)
+   │           ├─ free_huffman_tree(root)
+   │           ├─ fclose(out)
+   │           ├─ pthread_mutex_lock(print_mutex)   ← RC: stdout
+   │           ├─ printf(...)
+   │           └─ pthread_mutex_unlock(print_mutex)
+   ├─ [loop pthread_join]
+   ├─ pthread_mutex_destroy
+   ├─ free blocks
+   └─ clock_gettime (fin) → imprime tiempo
+
+──────────────────────────────────────────────
+compute_compressed_bytes(freq[256])  → size_t
+──────────────────────────────────────────────
+  Igual que en parallel/decompress.c.
+  Construye un arbol temporal, calcula total_bits, lo destruye.
+  Retorna (total_bits + 7) / 8.
+  Llamada desde el hilo principal antes de lanzar hilos → no hay
+  acceso concurrente.
+
+──────────────────────────────────────────────
+Pre-construccion de arboles (en main, antes de pthread_create)
+──────────────────────────────────────────────
+  Loop serial:
+    for i = 0..N-1:
+      blocks[i].tree = build_huffman_tree(blocks[i].freq)
+
+  Por que es necesario:
+    Si cada hilo construyera su propio arbol con build_huffman_tree(),
+    todos estarian llamando a malloc() simultaneamente sobre el mismo
+    heap del proceso.  El allocador de memoria tiene locks internos para
+    proteger su estado: con 91 hilos compitiendo, esa contension de
+    malloc penaliza fuertemente el rendimiento (en pruebas: 3334 ms).
+    Al construir los arboles serialmente antes de lanzar los hilos,
+    se elimina completamente esa contension.  Los hilos solo LEEN
+    el arbol (tree->left, tree->right, byte) → no necesitan mutex.
+
+──────────────────────────────────────────────
+thread_decode(void *arg)  → void*
+──────────────────────────────────────────────
+  Funcion de hilo.  Recibe un puntero a FileBlock.
+
+  Paso 1 — Preparar salida:
+    Construye out_path = output_dir + "/" + block->rel_path.
+    ensure_parent_dirs crea subdirectorios si hacen falta.
+    Abre el archivo de salida en modo "wb".
+    Si original_size == 0: cierra y retorna con success=1.
+
+  Paso 2 — Obtener el arbol:
+    root = block->tree  (ya construido, solo lectura)
+    No se llama a build_huffman_tree() aqui.
+
+  Paso 3 — Alloc buffer de decodificacion:
+    decode_buf = malloc(block->original_size)
+    Este buffer es LOCAL al hilo (cada hilo tiene el suyo).
+    Guardar aqui los bytes decodificados en lugar de escribirlos
+    con fputc() uno a uno elimina el overhead de locking de stdio
+    y reduce las llamadas al sistema operativo a una sola (fwrite).
+
+  Paso 4 — Lector de bits directo (macro READ_BIT):
+    En vez de usar BitReader con fmemopen/fgetc, se accede directamente
+    al array blocks[i].data con un puntero:
+
+      const uint8_t *src     = block->data   (datos comprimidos)
+      size_t         src_pos = 0             (posicion actual en bytes)
+      uint8_t        bit_buf = 0             (byte actual siendo consumido)
+      int            bit_cnt = 0             (bits restantes en bit_buf)
+
+    El macro READ_BIT(dest_bit):
+      Si bit_cnt == 0: carga el siguiente byte (src[src_pos++]) en bit_buf,
+                       pone bit_cnt = 8.
+      Extrae el bit MSB: dest_bit = (bit_buf & 0x80) ? 1 : 0
+      Desplaza bit_buf << 1, decrementa bit_cnt.
+
+    Esto es identico en logica a BitReader, pero sin ningun FILE* ni
+    llamada a fgetc → sin locks de stdio → mucho mas rapido con multiples
+    hilos activos simultaneamente.
+
+  Paso 5 — Decodificar:
+    Caso especial (arbol con un solo simbolo):
+      root->left existe, root->right no.
+      Se hace memset(decode_buf, byte, original_size).
+      No se leen bits (el compresor no escribio ninguno).
+    Caso normal:
+      Loop original_size veces:
+        curr = root
+        Mientras curr no sea hoja: READ_BIT → izquierda o derecha.
+        decode_buf[w] = curr->byte.
+
+  Paso 6 — Escribir resultado:
+    fwrite(decode_buf, 1, block->original_size, out)
+    Un solo fwrite en lugar de N fputc reduce drasticamente la
+    contension de I/O entre hilos que escriben simultaneamente.
+    free(decode_buf).
+    free_huffman_tree(root).
+    fclose(out).
+
+  Paso 7 — Imprimir (REGION CRITICA):
+    pthread_mutex_lock(block->print_mutex)
+    printf("Recuperado: %s\n", block->rel_path)
+    pthread_mutex_unlock(block->print_mutex)
+
+  Al retornar, block->success = 1.
+
+──────────────────────────────────────────────
+main  — HILO PRINCIPAL
+──────────────────────────────────────────────
+  1. Valida argumentos.
+  2. clock_gettime → ts_start.
+  3. MKDIR(output_dir).
+  4. Abre el .bin.  Valida magic.  Lee file_count.
+  5. calloc(file_count, sizeof(FileBlock)) → blocks[].
+  6. Inicializa print_mutex.
+  7. Loop lectura secuencial (i=0..file_count-1):
+       Lee path_len, rel_path, original_size, freq[256].
+       Calcula data_len con compute_compressed_bytes(freq).
+       malloc(data_len) → blocks[i].data.
+       fread(data_len bytes del .bin) → blocks[i].data.
+       Asigna output_dir y &print_mutex a cada bloque.
+  8. Cierra el .bin.
+  9. Loop pre-construccion (i=0..file_count-1):
+       blocks[i].tree = build_huffman_tree(blocks[i].freq)
+     [Este loop es serial y rapido: N arboles en secuencia.]
+  10. malloc(file_count * sizeof(pthread_t)) → threads[].
+  11. Loop pthread_create (i=0..file_count-1):
+        pthread_create(&threads[i], NULL, thread_decode, &blocks[i])
+  12. Loop pthread_join (i=0..file_count-1).
+  13. pthread_mutex_destroy.
+  14. Verifica success de cada bloque.
+  15. Libera blocks[i].data y el array blocks.
+  16. clock_gettime → ts_end.  Imprime tiempo.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  REGIONES CRITICAS — ANALISIS COMPLETO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+compress.c:
+
+  RECURSO           | TIPO DE ACCESO | REGION CRITICA? | PROTECCION
+  ──────────────────┼────────────────┼─────────────────┼────────────────
+  args[i].out_buf   | escritura      | NO              | Cada hilo i
+  args[i].out_size  | escritura      | NO              | accede solo a
+  args[i].success   | escritura      | NO              | su elemento i
+  ──────────────────┼────────────────┼─────────────────┼────────────────
+  FILE *mem_fp      | escritura      | NO              | privado por hilo
+  ──────────────────┼────────────────┼─────────────────┼────────────────
+  heap del proceso  | malloc/free    | SI (implicita)  | gestionada por
+  (build_huffman)   |                |                 | el allocador
+  ──────────────────┼────────────────┼─────────────────┼────────────────
+  stdout (printf)   | escritura      | SI              | print_mutex
+
+decompress.c:
+
+  RECURSO           | TIPO DE ACCESO | REGION CRITICA? | PROTECCION
+  ──────────────────┼────────────────┼─────────────────┼────────────────
+  blocks[i].data    | solo lectura   | NO              | inmutable
+  blocks[i].tree    | solo lectura   | NO              | inmutable
+  blocks[i].success | escritura      | NO              | elemento propio
+  ──────────────────┼────────────────┼─────────────────┼────────────────
+  decode_buf        | escritura      | NO              | alloc local
+  ──────────────────┼────────────────┼─────────────────┼────────────────
+  archivo de salida | escritura      | NO              | cada hilo
+                    |                |                 | escribe distinto
+  ──────────────────┼────────────────┼─────────────────┼────────────────
+  stdout (printf)   | escritura      | SI              | print_mutex
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FLUJO COMPLETO DE compress (ejemplo con 3 archivos, 2 nucleos)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  HILO PRINCIPAL:
+    recolecta archivos → prepara args[0..2] → pthread_create x3
+         |
+         |── HILO 0:  compress a.txt → args[0].out_buf ─────────┐
+         |── HILO 1:  compress b.txt → args[1].out_buf ───────┐ |
+         |── HILO 2:  compress c.txt → args[2].out_buf ─────┐ | |
+         | (join)                                            | | |
+         |                                                   v v v
+    join hilo 0, join hilo 1, join hilo 2
+    out_buf[0], out_buf[1], out_buf[2] disponibles en RAM
+         |
+    abre salida.bin → escribe "HUF1" + 3
+    fwrite(out_buf[0]) → fwrite(out_buf[1]) → fwrite(out_buf[2])
+    free(out_buf[0, 1, 2])
+    cierra salida.bin
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FLUJO COMPLETO DE decompress (ejemplo con 3 archivos, 2 nucleos)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  HILO PRINCIPAL (serial):
+    lee .bin → llena blocks[0], blocks[1], blocks[2]
+    cierra .bin
+    build_huffman_tree(blocks[0].freq) → blocks[0].tree
+    build_huffman_tree(blocks[1].freq) → blocks[1].tree
+    build_huffman_tree(blocks[2].freq) → blocks[2].tree
+    pthread_create x3
+         |
+         |── HILO 0:  decodifica blocks[0].data → a.txt  (alloc/free decode_buf)
+         |── HILO 1:  decodifica blocks[1].data → b.txt  (alloc/free decode_buf)
+         |── HILO 2:  decodifica blocks[2].data → c.txt  (alloc/free decode_buf)
+         | (join)
+         |
+    join todos → libera blocks → imprime tiempo
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  POR QUE LA OPTIMIZACION DE decode_buf IMPORTA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Version sin optimizar (fputc por caracter):
+    Un libro de 500 KB con codigos Huffman de ~5 bits promedio tiene
+    ~800.000 caracteres → 800.000 llamadas a fputc().
+    fputc() internamente llama a flockfile/funlockfile (operaciones
+    atomicas) sobre el FILE* de salida.  Con 91 hilos haciendo esto
+    simultaneamente, se generan millones de operaciones atomicas
+    en paralelo → contension en el bus de memoria.
+    Resultado medido: 3334 ms (mas lento que serial de 2861 ms).
+
+  Version optimizada (decode_buf + fwrite):
+    91 hilos escriben en sus propios arrays en RAM (decode_buf[w] = byte).
+    Operacion de escritura simple, sin locks, sin syscalls.
+    Al terminar, un solo fwrite() de N bytes al archivo de salida.
+    Resultado medido: 140 ms (24x mas rapido que la version sin optimizar).
+
+  Diferencia entre pthread y fork para decompress:
+    fork: cada proceso tiene su propio heap → malloc sin contension.
+          fputc sobre FILE* propio del proceso → sin contension cruzada.
+    pthread: heap compartido → malloc compite → contension.
+             FILE* "privado" por hilo pero en el mismo proceso → flockfile
+             tiene overhead mayor que en procesos separados.
+    Por eso fork descompress (829 ms) < pthread sin optimizar (3334 ms).
+    Pero pthread con decode_buf (140 ms) << fork (829 ms):
+    al eliminar el stdio del hot path, los hilos aprovechan mejor
+    la cache compartida y el ancho de banda de memoria.
+========================================================================

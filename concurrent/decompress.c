@@ -18,12 +18,13 @@
 
 /* ─── Bloque de datos de un archivo comprimido ──────────────────────────── */
 typedef struct {
-    char     rel_path[PATH_BUF_SIZE];
-    uint64_t original_size;
-    uint64_t freq[256];
-    uint8_t *data;
-    size_t   data_len;
-    int      success;
+    char         rel_path[PATH_BUF_SIZE];
+    uint64_t     original_size;
+    uint64_t     freq[256];
+    uint8_t     *data;
+    size_t       data_len;
+    HuffmanNode *tree;       /* arbol pre-construido por el hilo principal */
+    int          success;
     const char      *output_dir;
     pthread_mutex_t *print_mutex; /* mutex compartido para printf */
 } FileBlock;
@@ -69,50 +70,60 @@ static void *thread_decode(void *arg) {
         return NULL;
     }
 
-    HuffmanNode *root = build_huffman_tree(block->freq);
+    /* El arbol ya fue construido por el hilo principal — sin malloc concurrente */
+    HuffmanNode *root = block->tree;
     if (!root) { fclose(out); return NULL; }
 
     /*
-     * fmemopen: FILE* de solo lectura sobre el buffer en memoria.
-     * REGION CRITICA: cada hilo tiene su propio FILE* y escribe en su propio archivo.
-     * No hay acceso compartido a datos mutables aqui.
+     * Buffer de decodificacion en memoria: evita millones de fputc() con sus
+     * llamadas internas de locking de stdio.  Un solo fwrite() al terminar
+     * minimiza la contención de I/O entre hilos.
      */
-    FILE *mem_in = fmemopen(block->data, block->data_len > 0 ? block->data_len : 1, "rb");
-    if (!mem_in) { perror("fmemopen"); free_huffman_tree(root); fclose(out); return NULL; }
+    uint8_t *decode_buf = malloc(block->original_size);
+    if (!decode_buf) { perror("malloc decode_buf"); free_huffman_tree(root); fclose(out); return NULL; }
 
-    BitReader br;
-    bit_reader_init(&br, mem_in);
+    /* Lector de bits directo sobre el buffer comprimido (sin fmemopen ni fgetc) */
+    const uint8_t *src     = block->data;
+    size_t         src_pos = 0;
+    uint8_t        bit_buf = 0;
+    int            bit_cnt = 0;
+
+#define READ_BIT(dest_bit) do {                         \
+    if (bit_cnt == 0) {                                 \
+        if (src_pos >= block->data_len) { (dest_bit) = -1; break; } \
+        bit_buf = src[src_pos++];                       \
+        bit_cnt = 8;                                    \
+    }                                                   \
+    (dest_bit) = (bit_buf & 0x80) ? 1 : 0;             \
+    bit_buf <<= 1;                                      \
+    bit_cnt--;                                          \
+} while(0)
 
     /* Caso especial: arbol con un solo simbolo */
     if (root->left && !root->right && root->left->is_leaf) {
-        for (uint64_t i = 0; i < block->original_size; i++)
-            fputc(root->left->byte, out);
-        uint64_t pad_bits = (8 - (block->original_size % 8)) % 8;
-        for (uint64_t i = 0; i < pad_bits; i++)
-            if (bit_reader_read_bit(&br) < 0) break;
-        free_huffman_tree(root);
-        fclose(mem_in); fclose(out);
-        pthread_mutex_lock(block->print_mutex);
-        printf("Recuperado: %s\n", block->rel_path);
-        pthread_mutex_unlock(block->print_mutex);
-        block->success = 1;
-        return NULL;
-    }
-
-    /* Decodificacion normal */
-    for (uint64_t written = 0; written < block->original_size; written++) {
-        HuffmanNode *curr = root;
-        while (curr && !curr->is_leaf) {
-            int bit = bit_reader_read_bit(&br);
-            if (bit < 0) { free_huffman_tree(root); fclose(mem_in); fclose(out); return NULL; }
-            curr = (bit == 0) ? curr->left : curr->right;
+        memset(decode_buf, root->left->byte, block->original_size);
+    } else {
+        /* Decodificacion normal — escribe a decode_buf, no a FILE* */
+        for (uint64_t w = 0; w < block->original_size; w++) {
+            HuffmanNode *curr = root;
+            while (curr && !curr->is_leaf) {
+                int bit = -1;
+                READ_BIT(bit);
+                if (bit < 0) {
+                    free(decode_buf); free_huffman_tree(root); fclose(out); return NULL;
+                }
+                curr = (bit == 0) ? curr->left : curr->right;
+            }
+            if (!curr) { free(decode_buf); free_huffman_tree(root); fclose(out); return NULL; }
+            decode_buf[w] = curr->byte;
         }
-        if (!curr) { free_huffman_tree(root); fclose(mem_in); fclose(out); return NULL; }
-        fputc(curr->byte, out);
     }
+#undef READ_BIT
 
+    /* Un solo fwrite: mucho menos contención de I/O que N fputc */
+    fwrite(decode_buf, 1, block->original_size, out);
+    free(decode_buf);
     free_huffman_tree(root);
-    fclose(mem_in);
     fclose(out);
 
     pthread_mutex_lock(block->print_mutex);
@@ -186,7 +197,13 @@ int main(int argc, char *argv[]) {
     }
     fclose(in);
 
-    /* 2. Lanzar un hilo por archivo */
+    /* 2. Pre-construir todos los arboles Huffman en el hilo principal (serial).
+     *    Elimina la contención de malloc cuando 91 hilos llaman a
+     *    build_huffman_tree() simultaneamente sobre el mismo heap. */
+    for (uint32_t i = 0; i < file_count; i++)
+        blocks[i].tree = build_huffman_tree(blocks[i].freq);
+
+    /* 3. Lanzar un hilo por archivo */
     pthread_t *threads = malloc(file_count * sizeof(pthread_t));
     if (!threads) { perror("malloc"); free(blocks); return 1; }
 
@@ -198,7 +215,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 3. Esperar a todos los hilos */
+    /* 4. Esperar a todos los hilos */
     for (uint32_t i = 0; i < file_count; i++)
         pthread_join(threads[i], NULL);
     free(threads);

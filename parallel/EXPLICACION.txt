@@ -1,0 +1,315 @@
+========================================================================
+  VERSION PARALELA — compress.c / decompress.c
+  Huffman Compressor/Descompressor — Paralelismo con fork()
+========================================================================
+
+Cada archivo se comprime/descomprime en un proceso hijo independiente.
+Los procesos hijos corren en paralelo real sobre multiples nucleos del CPU.
+El proceso padre los coordina: los lanza, espera que terminen y
+ensambla el resultado final.
+
+API del sistema operativo usada:
+  fork()     → crea un proceso hijo (copia del padre)
+  waitpid()  → el padre espera a que un hijo especifico termine
+  exit()     → el hijo termina e informa su codigo de retorno
+  unlink()   → elimina archivos temporales del disco
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  STRUCTS UTILIZADOS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+──────────────────────────────────────────────
+FileList  (compress.c)
+──────────────────────────────────────────────
+  Igual que en serial.  Ver EXPLICACION.txt de serial para detalle.
+  Creada y usada SOLO por el proceso padre antes de hacer fork.
+
+──────────────────────────────────────────────
+FileBlock  (decompress.c)
+──────────────────────────────────────────────
+  char     rel_path[4096]  → ruta relativa del archivo (ej: "sub/libro.txt")
+  uint64_t original_size   → tamaño descomprimido en bytes
+  uint64_t freq[256]       → tabla de frecuencias (256 entradas de 8 bytes)
+  uint8_t *data            → puntero al buffer con los bytes comprimidos
+  size_t   data_len        → cuantos bytes comprimidos hay en data[]
+
+  Proposito: el padre carga TODOS los bloques del .bin en un array de
+  FileBlock antes de hacer fork.  Cuando fork() copia la memoria (CoW),
+  cada hijo tiene acceso a su propio FileBlock sin comunicacion adicional.
+
+  Por que es necesario pre-cargar:
+    El .bin es un stream secuencial.  No se puede hacer seek al bloque N
+    sin haber leido los bloques 0..N-1 (los tamanos de los datos
+    comprimidos no estan almacenados directamente: se calculan a partir
+    de freq[]).  Por eso el padre lee todo primero y luego fork().
+
+──────────────────────────────────────────────
+HuffmanNode, HuffCode, BitWriter, BitReader
+──────────────────────────────────────────────
+  Identicos a la version serial.  Cada hijo tiene su propia copia
+  en su propio heap (copy-on-write de fork).  No hay conflicto posible.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  compress.c — FUNCIONES Y ORDEN DE EJECUCION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Diagrama de llamadas:
+  main (PADRE)
+   ├─ clock_gettime (inicio)
+   ├─ collect_files_recursive
+   ├─ preparar tmp_paths[]  ("/tmp/huff_<PID>_<i>")
+   ├─ [loop fork — lanza N hijos en rapida sucesion]
+   │   └─ fork()
+   │       └─ [HIJO i] child_compress(tmp_paths[i], input_dir, items[i])
+   │               ├─ fopen(tmp_paths[i], "wb")
+   │               ├─ compress_one_file(out, ...)
+   │               │   ├─ compute_frequencies
+   │               │   ├─ build_huffman_tree
+   │               │   ├─ build_codes
+   │               │   ├─ write metadatos
+   │               │   ├─ bit_writer + loop codificacion
+   │               │   └─ free_huffman_tree
+   │               ├─ fclose
+   │               └─ exit(0 o 1)
+   ├─ [loop waitpid — padre espera a todos los hijos]
+   ├─ fopen salida.bin
+   ├─ fwrite HUFF_MAGIC + write_u32
+   ├─ [loop ensamblado — lee cada tmp file y lo copia al .bin]
+   │   ├─ fopen(tmp_paths[i], "rb")
+   │   ├─ fread/fwrite en bloques
+   │   ├─ fclose
+   │   └─ unlink(tmp_paths[i])
+   ├─ fclose salida.bin
+   ├─ file_list_free
+   └─ clock_gettime (fin) → imprime tiempo
+
+──────────────────────────────────────────────
+file_list_init / file_list_free / file_list_add
+──────────────────────────────────────────────
+  Identicas a la version serial.  Solo las usa el padre.
+
+──────────────────────────────────────────────
+collect_files_recursive(base_dir, rel_dir, list)  → int
+──────────────────────────────────────────────
+  Identica a serial.  Solo la ejecuta el padre, antes de fork.
+
+──────────────────────────────────────────────
+compute_frequencies(filepath, freq[], *original_size)  → int
+──────────────────────────────────────────────
+  Identica a serial.  Llamada desde compress_one_file, que corre
+  en el proceso hijo.  No hay concurrencia: cada hijo trabaja sobre
+  su propio archivo.
+
+──────────────────────────────────────────────
+compress_one_file(FILE *out, base_dir, rel_path)  → int
+──────────────────────────────────────────────
+  Identica a serial.  Corre en el proceso hijo.
+  El FILE *out en este caso es el archivo temporal del hijo
+  (/tmp/huff_<PID_padre>_<i>), no el .bin final.
+  El hijo escribe SOLO los bytes de su archivo (sin header global).
+
+──────────────────────────────────────────────
+child_compress(tmp_path, base_dir, rel_path)
+──────────────────────────────────────────────
+  Funcion que ejecuta UNICAMENTE el proceso hijo tras fork().
+  1. Abre el archivo temporal en modo "wb".
+  2. Llama a compress_one_file.
+  3. Cierra el archivo.
+  4. Llama a exit(0) si exito, exit(1) si fallo.
+  NUNCA retorna al llamador.  Usar exit() y no return() garantiza
+  que el hijo no continue ejecutando codigo del padre.
+
+──────────────────────────────────────────────
+main(argc, argv)  — PROCESO PADRE
+──────────────────────────────────────────────
+  1. Valida argumentos.
+  2. clock_gettime → ts_start.
+  3. collect_files_recursive → FileList con N archivos.
+  4. Prepara N rutas temporales antes de fork:
+       tmp_paths[i] = "/tmp/huff_<getpid()>_<i>"
+     Usar el PID del padre en el nombre evita colisiones si se
+     ejecutan multiples instancias del programa simultaneamente.
+  5. Alloca array de pid_t pids[N].
+  6. Loop fork (i=0..N-1):
+       pids[i] = fork()
+       Si pids[i] == 0: es el HIJO → llama child_compress y nunca retorna.
+       Si pids[i] > 0:  es el PADRE → continua el loop.
+       Si pids[i] < 0:  error de fork → espera hijos ya lanzados y sale.
+  7. Loop waitpid (i=0..N-1):
+       waitpid(pids[i], &status, 0) → bloquea hasta que el hijo i termine.
+       WIFEXITED(status) verifica terminacion normal.
+       WEXITSTATUS(status) obtiene el codigo de salida (0=ok, 1=error).
+  8. Abre el .bin de salida.
+  9. Escribe "HUF1" + file_count (header global).
+  10. Loop ensamblado (i=0..N-1):
+        Abre tmp_paths[i] para lectura.
+        Lee en bloques y copia al .bin (preserva el orden original).
+        Cierra y elimina el archivo temporal con unlink().
+  11. Cierra el .bin.  Libera memoria.
+  12. clock_gettime → ts_end.  Imprime tiempo.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  decompress.c — FUNCIONES Y ORDEN DE EJECUCION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Diagrama de llamadas:
+  main (PADRE)
+   ├─ clock_gettime (inicio)
+   ├─ MKDIR(output_dir)
+   ├─ fopen .bin
+   ├─ leer magic + file_count
+   ├─ [loop lectura secuencial — carga todos los bloques en memoria]
+   │   └─ compute_compressed_bytes  (calcula tamaño del bloque comprimido)
+   │       ├─ build_huffman_tree
+   │       ├─ build_codes
+   │       └─ free_huffman_tree
+   ├─ fclose .bin
+   ├─ [loop fork — lanza N hijos en rapida sucesion]
+   │   └─ fork()
+   │       └─ [HIJO i] child_decode(output_dir, &blocks[i])
+   │               ├─ ensure_parent_dirs
+   │               ├─ fopen (archivo de salida)
+   │               ├─ build_huffman_tree(blocks[i].freq)
+   │               ├─ fmemopen(blocks[i].data, ...) → FILE* en memoria
+   │               ├─ bit_reader_init
+   │               ├─ [loop decodificacion]
+   │               │   ├─ bit_reader_read_bit
+   │               │   └─ fputc
+   │               ├─ free_huffman_tree
+   │               ├─ fclose x2
+   │               └─ exit(0 o 1)
+   ├─ [loop waitpid]
+   └─ clock_gettime (fin) → imprime tiempo
+
+──────────────────────────────────────────────
+compute_compressed_bytes(freq[256])  → size_t
+──────────────────────────────────────────────
+  Necesitamos saber cuantos bytes leer del .bin por cada archivo,
+  pero el formato NO almacena ese dato directamente.  Lo calculamos:
+  1. Reconstruye el arbol Huffman a partir de freq[].
+  2. Genera los codigos con build_codes.
+  3. Suma: total_bits = sum(freq[i] * codes[i].length) para i=0..255.
+  4. compressed_bytes = (total_bits + 7) / 8  (division con techo).
+  5. Libera el arbol (este arbol es temporal, solo para calcular el tamaño).
+  El arbol real para decodificar lo construye despues cada hijo.
+
+──────────────────────────────────────────────
+child_decode(output_dir, FileBlock *block)
+──────────────────────────────────────────────
+  Funcion que ejecuta UNICAMENTE el proceso hijo.
+  1. Construye la ruta de salida: output_dir + "/" + block->rel_path.
+  2. ensure_parent_dirs crea subdirectorios si no existen.
+  3. Abre el archivo de salida en modo "wb".
+  4. Si original_size == 0: cierra y exit(0) (archivo vacio).
+  5. build_huffman_tree(block->freq) → reconstruye el arbol.
+     IMPORTANTE: cada hijo hace esto en su propio heap.  Como fork()
+     crea procesos con espacios de memoria separados, no hay contension
+     de malloc entre hijos.
+  6. fmemopen(block->data, block->data_len, "rb"):
+     Crea un FILE* que lee desde el buffer en memoria (no hace I/O real).
+     Esto permite usar BitReader sin modificar las funciones de huffman.c.
+  7. bit_reader_init sobre ese FILE*.
+  8. Caso especial (un solo simbolo):
+       Si root->left existe y root->right no:
+       Escribe el mismo byte original_size veces con fputc.
+       Consume los bits de padding con bit_reader_read_bit.
+  9. Caso normal:
+       Loop original_size veces:
+         Parte de root, lee bits hasta llegar a una hoja, escribe fputc.
+  10. Libera arbol, cierra ambos FILE*.
+  11. exit(0) si exito, exit(1) si cualquier error.
+
+──────────────────────────────────────────────
+main(argc, argv)  — PROCESO PADRE
+──────────────────────────────────────────────
+  1. Valida argumentos.
+  2. clock_gettime → ts_start.
+  3. MKDIR(output_dir).
+  4. Abre el .bin.  Valida magic.  Lee file_count.
+  5. calloc(file_count, sizeof(FileBlock)) → array blocks[].
+  6. Loop lectura (i=0..file_count-1):
+       Lee path_len, rel_path, original_size, freq[256].
+       Llama compute_compressed_bytes(freq) → data_len.
+       malloc(data_len) → blocks[i].data.
+       fread(data_len bytes) → blocks[i].data.
+     Al terminar este loop, el .bin esta completamente leido y cerrado.
+     Toda la informacion esta en memoria.
+  7. malloc(file_count * sizeof(pid_t)) → array pids[].
+  8. Loop fork (i=0..file_count-1):
+       pids[i] = fork()
+       Hijo: child_decode(output_dir, &blocks[i])  → exit.
+       Padre: continua.
+  9. Loop waitpid (i=0..file_count-1).
+  10. Libera blocks[i].data y el array blocks.
+  11. clock_gettime → ts_end.  Imprime tiempo.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FLUJO COMPLETO DE compress (ejemplo con 3 archivos)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Linea de tiempo (con 2 nucleos disponibles):
+
+  PADRE: recolecta archivos → prepara rutas tmp → fork x3
+         |                                          |
+         |── fork hijo_0 ──────────────────────────|
+         |── fork hijo_1 ─────────────────┐        |
+         |── fork hijo_2 ──────┐          |        |
+         | (espera)            |          |        |
+         |                     v          v        v
+  HIJOS:                  [hijo_2]   [hijo_1]  [hijo_0]
+                          compress   compress  compress
+                          a /tmp/2   a /tmp/1  a /tmp/0
+                             |          |         |
+                           exit(0)   exit(0)   exit(0)
+         |
+         | (waitpid recibe todos)
+         |
+  PADRE: abre salida.bin → escribe header →
+         lee /tmp/0 → copia → unlink
+         lee /tmp/1 → copia → unlink
+         lee /tmp/2 → copia → unlink
+         cierra salida.bin
+
+  REGION CRITICA: ninguna.
+    Los hijos escriben en archivos temporales distintos.
+    El padre ensambla en solitario (todos los hijos ya terminaron).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FLUJO COMPLETO DE decompress (ejemplo con 3 archivos)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  PADRE: lee .bin secuencialmente → carga blocks[0], blocks[1], blocks[2]
+         cierra .bin → fork x3
+         |
+         |── fork hijo_0 → decodifica blocks[0] → escribe a.txt  → exit(0)
+         |── fork hijo_1 → decodifica blocks[1] → escribe b.txt  → exit(0)
+         |── fork hijo_2 → decodifica blocks[2] → escribe c.txt  → exit(0)
+         | (espera)
+         |
+         | (waitpid recibe todos)
+         |
+  PADRE: libera memoria, imprime tiempo.
+
+  REGION CRITICA: ninguna.
+    Cada hijo trabaja en su propio espacio de memoria (fork = procesos
+    separados con heap propio).  Cada hijo escribe en un archivo diferente.
+    El stdout puede intercalarse entre hijos (printf no es atomico entre
+    procesos), pero eso no afecta la correctitud.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  POR QUE fork() ES RAPIDO PARA DECOMPRESS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - Cada hijo tiene su propio heap: malloc en build_huffman_tree no
+    compite con otros procesos.  No hay locks de allocador.
+  - El OS puede distribuir los procesos en nucleos distintos con
+    un scheduler mas agresivo que para hilos.
+  - Copy-on-write: los bloques de datos en blocks[] no se copian
+    fisicamente hasta que un hijo los modifica (en este caso no los
+    modifica, solo los lee → cero copia real).
+========================================================================
