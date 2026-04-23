@@ -201,7 +201,7 @@ du -h ../gutenberg_books
 
 ## Concurrente
 
-Una vez probado concurrente, ahora nos regresamos al directorio principal para entrar al directorio de `concurrent`
+Una vez probado paralelo, ahora nos regresamos al directorio principal para entrar al directorio de `concurrent`
 
 ```bash
 cd ..
