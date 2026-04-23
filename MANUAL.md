@@ -91,6 +91,8 @@ cd ..
 
 **Nota:** en caso que se caiga la ejecución o no logre llegar a los 100, volver a ejecutar el script. Si no, instalar uno por uno, pues pasa que a veces existen audio libros.
 
+## 2. Ejecuciones
+
 ## Serial
 ### 1. Comprimir en forma Serial
 Una vez verificado que se encuentan los libros en la carpeta `gutenberg_books` procedemos a comprimir los libros utilizando el algoritmo de Huffman de forma Serial, nos dirigimos a la carpeta `serial`
@@ -192,6 +194,10 @@ Similar a lo en la parte serial, para descomprimir el comprimido lo que debemos 
 El proceso de descomprimido en paralelo es una cuarta parte más rápido de lo que duró en serial. 
 
 Si vemos el tamaño del resultado con `du -h descomprimido_parallel`, es el mismo tamaño que `gutenberg_books`.
+```bash
+du -h descomprimido_parallel
+du -h ../gutenberg_books
+```
 
 ## Concurrente
 
