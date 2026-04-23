@@ -11,7 +11,8 @@
 
 set -e
 
-OUTPUT_DIR="gutenberg_books"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUTPUT_DIR="$SCRIPT_DIR/../gutenberg_books"
 IDS_FILE="/tmp/gutenberg_ids.txt"
 TOP_URL="https://www.gutenberg.org/browse/scores/top"
 MAX_BOOKS=100

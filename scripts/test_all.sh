@@ -5,7 +5,7 @@
 
 set -e  # salir si cualquier comando falla
 
-PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_INPUT="$PROJECT_ROOT/test_input"
 OUT_DIR="$PROJECT_ROOT/test_output"
 
