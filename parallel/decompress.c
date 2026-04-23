@@ -101,7 +101,7 @@ static void child_decode(const char *output_dir, const FileBlock *block) {
     free_huffman_tree(root);
     fclose(mem_in);
     fclose(out);
-    printf("Recuperado: %s\n", block->rel_path);
+    //printf("Recuperado: %s\n", block->rel_path);
     exit(0);
 }
 

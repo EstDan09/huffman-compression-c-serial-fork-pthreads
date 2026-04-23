@@ -151,7 +151,8 @@ static void *thread_compress(void *arg) {
     /* stdout es region critica: proteger con mutex */
     pthread_mutex_lock(a->print_mutex);
     if (a->success)
-        printf("Comprimido (hilo): %s\n", a->rel_path);
+        //printf("Comprimido (hilo): %s\n", a->rel_path);
+        printf("|");
     else
         fprintf(stderr, "Error comprimiendo: %s\n", a->rel_path);
     pthread_mutex_unlock(a->print_mutex);

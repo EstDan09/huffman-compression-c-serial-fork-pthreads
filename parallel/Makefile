@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -O2
+CFLAGS = -Wall -O2 -Wno-format-truncation
 
 all: compress decompress
 
