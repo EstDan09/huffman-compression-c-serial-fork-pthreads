@@ -226,7 +226,7 @@ int main(int argc, char *argv[]) {
         fclose(tmp);
         unlink(tmp_paths[i]);
         free(tmp_paths[i]);
-        printf("Comprimido: %s\n", list.items[i]);
+        //printf("Comprimido: %s\n", list.items[i]);
     }
     free(tmp_paths);
     fclose(out);

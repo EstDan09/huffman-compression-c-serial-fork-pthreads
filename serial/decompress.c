@@ -96,7 +96,7 @@ static int decode_file(FILE *in, const char *output_dir) {
 
     free_huffman_tree(root);
     fclose(out);
-    printf("Recuperado: %s\n", rel_path);
+    // printf("Recuperado: %s\n", rel_path);
     return 1;
 }
 

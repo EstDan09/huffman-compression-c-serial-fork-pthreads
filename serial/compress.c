@@ -223,7 +223,7 @@ int main(int argc, char *argv[])
             file_list_free(&list);
             return 1;
         }
-        printf("Comprimido: %s\n", list.items[i]);
+        // printf("Comprimido: %s\n", list.items[i]);
     }
     fclose(out);
     file_list_free(&list);

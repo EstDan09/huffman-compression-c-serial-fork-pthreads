@@ -127,7 +127,7 @@ static void *thread_decode(void *arg) {
     fclose(out);
 
     pthread_mutex_lock(block->print_mutex);
-    printf("Recuperado: %s\n", block->rel_path);
+    //printf("Recuperado: %s\n", block->rel_path);
     pthread_mutex_unlock(block->print_mutex);
     block->success = 1;
     return NULL;
