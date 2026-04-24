@@ -1,5 +1,16 @@
 #!/bin/bash
 
+# Verificar si es root
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Este script debe ejecutarse como root."
+    echo "Usa: su -c './setup.sh'"
+    exit 1
+fi
+
+echo "Instalando dependencias..."
+apt-get update
+apt-get install -y curl build-essential
+
 # Preguntar al usuario si desea descargar ebooks
 read -p "¿Desea descargar ebooks? (s/n): " respuesta
 
@@ -11,16 +22,6 @@ else
     echo "Se omitió la descarga de ebooks."
 fi
 
-# Verificar si el script se está ejecutando como root
-if [[ "$EUID" -ne 0 ]]; then
-    echo "Este script necesita privilegios de administrador. Reejecutando con sudo..."
-    sudo bash "$0"
-    exit
-fi
-
-echo "Instalando dependencias..."
-apt-get update
-apt-get install -y curl build-essential
 
 # Compilar
 echo "Compilando 'serial'..."
