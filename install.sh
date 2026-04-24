@@ -3,7 +3,7 @@
 # Verificar si es root
 if [[ "$EUID" -ne 0 ]]; then
     echo "Este script debe ejecutarse como root."
-    echo "Usa: su -c './setup.sh'"
+    echo "Usa: su -c './install.sh'"
     exit 1
 fi
 
@@ -33,6 +33,8 @@ make -C parallel || { echo "No se pudo compilar 'parallel'"; exit 1; }
 echo "Compilando 'concurrent'..."
 make -C concurrent || { echo "No se pudo compilar 'concurrent'"; exit 1; }
 
+clear
+
 echo "====== Compilación finalizada ======"
 
 # Crear carpetas necesarias
@@ -55,16 +57,24 @@ while true; do
             echo "Ejecutando modo SERIAL..."
             ./serial/compress gutenberg_books comprimidos/serial.bin
             ./serial/decompress comprimidos/serial.bin descomprimidos/serial
+            echo "Tamaño del archivo comprimido:"
+            du -h comprimidos/serial.bin
+            echo "Tamaño total de los archivos descomprimidos:"
+            du -sh descomprimidos/serial
+            echo "Tamaño total de los archivos originales:"
+            du -sh gutenberg_books
+
             ;;
         2)
             echo "Ejecutando modo PARALELO..."
             ./parallel/compress gutenberg_books comprimidos/parallel.bin
             ./parallel/decompress comprimidos/parallel.bin descomprimidos/parallel
-            ;;
-        3)
-            echo "Ejecutando modo CONCURRENT..."
-            ./concurrent/compress gutenberg_books comprimidos/concurrent.bin
-            ./concurrent/decompress comprimidos/concurrent.bin descomprimidos/concurrent
+            echo "Tamaño del archivo comprimido:"
+            du -h comprimidos/parallel.bin
+            echo "Tamaño total de los archivos descomprimidos:"
+            du -sh descomprimidos/parallel
+            echo "Tamaño total de los archivos originales:"
+            du -sh gutenberg_books
             ;;
         4)
             echo "Saliendo..."
