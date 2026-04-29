@@ -73,15 +73,6 @@ while true; do
             du -h comprimidos/parallel.bin
             echo "Tamaño total de los archivos descomprimidos:"
             du -sh descomprimidos/parallel
-            ;;
-        3)
-            echo "Ejecutando modo CONCURRENT..."
-            ./concurrent/compress gutenberg_books comprimidos/concurrent.bin
-            ./concurrent/decompress comprimidos/concurrent.bin descomprimidos/concurrent
-            echo "Tamaño del archivo comprimido:"
-            du -h comprimidos/concurrent.bin
-            echo "Tamaño total de los archivos descomprimidos:"
-            du -sh descomprimidos/concurrent
             echo "Tamaño total de los archivos originales:"
             du -sh gutenberg_books
             ;;

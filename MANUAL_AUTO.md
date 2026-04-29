@@ -1,6 +1,5 @@
 # Instalacion Automatica
 
-Abrimos una terminal desde Debian
 
 Nos descargamos el ZIP desde Github usando el comando `wget`
 ```bash
@@ -13,12 +12,12 @@ Lo movemos al directorio de Documentos y extraemos los archivos ahi
 mv main.zip Documents
 cd Documents
 unzip main.zip
-cd huffman-compression-c-serial-fork-pthreads-main
+cd huffman-compression-c-serial-fork-pthreads
 clear
 ```
 
 Ejecutamos el instalador con los siguientes comandos:
 ```bash
 chmod +x install.sh
-su -c './install.sh'
+su -c 'install.sh'
 ```
